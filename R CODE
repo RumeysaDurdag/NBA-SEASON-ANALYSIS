@@ -1,0 +1,492 @@
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(caret)
+library(xgboost)
+library(mlbench)
+library(rpart)
+library(rpart.plot)
+library(dplyr)
+library(car)
+
+```
+We omitted columns that include a lot of NA values.
+
+```{r}
+dff <- read.csv("actions_last_3_years.csv")
+df <- dff[,-c(1,2,4,6,7,9,13,14,15,16,18,19,20,17,21,22,23,24,25,30,31,32,33,34,36,37,38,41,42,43,44,45,46)] 
+df <- na.omit(df) 
+```
+### QUESTION 1 
+
+This part, clock column was edited. Date part was omitted. Then minutes and seconds were summed.
+
+```{r}
+df$minutes <- as.integer(substr(df$clock, 12,13)) 
+df$seconds <- as.integer(substr(df$clock, 15,16))
+df <- df %>% mutate(time = 600-60*minutes-seconds) %>% filter(period %in% c(1,2)) %>% # total seconds of minutes and seconds were found.
+  group_by(matchId) %>% 
+  mutate(otherTeam = ifelse(levels(factor(teamId))[1] == teamId, 
+                            levels(factor(teamId))[2], 
+                            levels(factor(teamId))[1])) %>% mutate(team1 = as.numeric(ifelse(sum(personId %in% str_split(playersTeam1, ";")[[1]]) > 2, 
+                                                                                             teamId, 
+                                                                                             otherTeam)), 
+                                                                   team2 = as.numeric(ifelse(team1 == teamId, 
+                                                                                             otherTeam, 
+                                                                                             teamId)))
+```
+
+```{r}
+kog <- dff %>% drop_na(teamId) %>% group_by(matchId) %>%   
+  filter(period %in% c(1,2)) %>% dplyr::slice(n()) %>% select(matchId, score1, score2) %>% 
+  mutate(winner = ifelse(score1 > score2, 1, 2)) %>% select(matchId, winner) 
+
+k <- df %>% group_by(matchId, period, teamId) %>% arrange(time) %>% dplyr::slice(n())  
+kk <- df %>% group_by(matchId, period, teamId, actionType) %>% summarise(count=n()) %>% pivot_wider(id_cols = c(matchId, period, teamId), 
+                                                                                                    names_from = actionType,
+                                                                                                    values_from = count, values_fill = 0)
+k <- k %>% right_join(kk, by=c("matchId", "period" , "teamId")) %>% select(-clock, -personId, -playersTeam1, -playersTeam2,   
+                                                                           -firstName, -familyName, -minutes, -seconds, -teamName, 
+                                                                           -actionType, -otherTeam, -score1, -score2)
+
+k <- k %>% right_join(kog, by = "matchId")  
+k <- k %>% arrange(matchId, period, teamId, team1) %>% mutate(win = ifelse(winner==1, ifelse(teamId==team1, 1, 0), ifelse(teamId==team2, 1, 0)))  
+k <- k %>% ungroup() %>% select(-period, -teamId, -team1, -team2) 
+k <- k %>% group_by(matchId, win) %>% summarise(across(everything(), ~sum(.)))   
+k <- k %>% select(-winner)
+k <- k %>% ungroup() %>% select(-matchId, -time)
+```
+
+### MODELLING
+
+```{r}
+set.seed(493)
+knitr::opts_chunk$set(cache = T)
+colnames(k)[1:3] <- c("win",
+                      "pt2",
+                      "pt3")
+k$win <- ifelse(k$win == 1, "Win", "Loss")
+k$win <- factor(k$win)
+train <- sample(nrow(k), size=round(nrow(k)*.8))
+train.data <- k[train,]
+test.data <- k[-train,]
+
+```
+DECISION TREE
+R PART
+```{r}
+rpart.fit <- rpart(win~., data = train.data, method = 'class')
+rpart.fit
+rpart.plot(rpart.fit)
+```
+
+At the top, it is the overall probability of loose of team. 
+It shows the proportion of loose team 50 percent of win.
+
+
+Let’s calculate classification error rate and other measures for 
+both models considering both training and test data to see the performance of the model.
+```{r}
+
+calc_class_err = function(actual, predicted) {
+  mean(actual != predicted)
+}
+```
+
+```{r}
+## Train data performance.
+
+train_pred <- predict(rpart.fit, train.data[,-1], type= 'class')
+calc_class_err(as.numeric(unlist(train.data[,1]))-1,ifelse(as.vector(train_pred) == "Win", 1, 0))
+```
+
+
+
+```{r}
+# Test Data Performance
+rpart.test_pred <- predict(rpart.fit, test.data[,-1], type = 'class')
+calc_class_err(as.numeric(unlist(test.data[,1]))-1,ifelse(as.vector(rpart.test_pred) == "Win", 1, 0))
+```
+
+```{r}
+# Accuracy Sensivity and Specificity
+test_table <- table(predicted = rpart.test_pred , actual = test.data$win)
+test_table
+```
+
+```{r}
+test_con_mat = confusionMatrix(test_table)
+c(test_con_mat$overall["Accuracy"], 
+  test_con_mat$byClass["Sensitivity"], 
+  test_con_mat$byClass["Specificity"])
+```
+ CARET 
+```{r}
+
+train.control <- trainControl(
+  method = "repeatedcv",
+  number = 10, ## 10-fold CV
+  repeats = 3,## repeated three times
+  # USE AUC
+  summaryFunction = twoClassSummary, 
+  classProbs = TRUE
+)
+
+caret.fit <- train(win~., data=train.data, 
+                   method = "rpart2", 
+                   tuneLength = 6,
+                   trControl = train.control,
+                   metric = "ROC")
+
+rpart.plot(caret.fit$finalModel)
+
+caret.test_pred <-predict(caret.fit$finalModel, test.data[,-1], type = 'class')
+calc_class_err(as.numeric(unlist(test.data[,1]))-1,ifelse(as.vector(caret.test_pred) == "Win", 1, 0))
+```
+
+```{r}
+
+# Accuracy Sensivity and Specificity
+caret_table <- table(predicted = caret.test_pred , actual = test.data$win)
+caret_table
+```
+
+```{r}
+caret_con_mat = confusionMatrix(caret_table)
+c(caret_con_mat$overall["Accuracy"], 
+  caret_con_mat$byClass["Sensitivity"], 
+  caret_con_mat$byClass["Specificity"])
+
+```
+XGBOOST
+```{r}
+xgboost_model <- xgboost(data = as.matrix(train.data[, -1]), 
+                         label = as.numeric(train.data$win)-1,
+                         max_depth = 3, 
+                         objective = "binary:logistic", 
+                         nrounds = 10, 
+                         verbose = FALSE)
+```
+
+```{r}
+xg.test_pred <- predict(xgboost_model, as.matrix(test.data[,-1]), type = "response")
+xg.test_pred<-as.factor(ifelse(xg.test_pred >0.5,1,0))
+```
+
+```{r}
+xg_tab <- table(predicted = xg.test_pred, actual = test.data$win)
+xg_tab
+```
+
+```{r}
+# Accuracy Sensivity and Specificity
+
+xg_con_mat = confusionMatrix(xg.test_pred, reference = as.factor(as.numeric(unlist(test.data[,1]))-1))
+c(xg_con_mat$overall["Accuracy"], 
+  xg_con_mat$byClass["Sensitivity"], 
+  xg_con_mat$byClass["Specificity"])
+
+calc_class_err(as.numeric(unlist(test.data[,1]))-1,ifelse(as.vector(xg.test_pred) == "Win", 1, 0))
+
+```
+
+### QUESTION 2
+
+New data 
+```{r}
+df <- read.csv("actions_last_3_years.csv")
+a <- df[,-c(1,2,4,6,7,9,13,14,15,16,18,19,20,17,21,22,23,24,25,30,31,32,33,34,36,37,38,41,42,43,44,45,46)]
+a <- a %>% filter(period %in% c(1,2))
+```
+
+
+```{r}
+action3 <- a %>% rowwise() %>% 
+  mutate(homeaway = ifelse(personId %in% str_split(playersTeam1,";")[[1]],"HOME",
+                           ifelse(personId %in% str_split(playersTeam2,";")[[1]], "AWAY","NA"))) %>%
+  filter(homeaway != "NA") 
+action3 <- action3[-1,]
+
+```
+
+
+```{r}
+two_p <- action3 %>% filter(grepl('2pt', actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(two_p) <- c("matchId", "two_p_away","two_p_home")
+my_data<-merge(action3,two_p,by="matchId")
+
+three_p <- action3 %>% 
+  filter(grepl('3pt', actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(three_p) <- c("matchId", "three_p_away","three_p_home")
+my_data<-merge(my_data,three_p,by="matchId")
+
+
+jump <- action3 %>% 
+  filter(grepl("jump", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(jump) <- c("matchId", "jump_away","jump_home")
+my_data<-merge(my_data,jump,by="matchId")
+
+
+assist <- action3 %>% 
+  filter(grepl("assist", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(assist) <- c("matchId", "assist_away","assist_home")
+my_data<-merge(my_data,assist,by="matchId")
+
+
+turnover <- action3 %>% 
+  filter(grepl("turnover", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(turnover) <- c("matchId", "turnover_away","turnover_home")
+my_data<-merge(my_data,turnover,by="matchId")
+
+steal <- action3 %>% 
+  filter(grepl("steal", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(steal) <- c("matchId", "steal_away","steal_home")
+my_data<-merge(my_data,steal,by="matchId")
+
+rebound <- action3 %>% 
+  filter(grepl("rebound", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(rebound) <- c("matchId", "rebound_away","rebound_home")
+my_data<-merge(my_data,rebound,by="matchId")
+
+
+block <- action3 %>% 
+  filter(grepl("block", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(block) <- c("matchId", "block_away","block_home")
+my_data<-merge(my_data,block,by="matchId")
+
+
+foul <- action3 %>% 
+  filter(grepl("foul", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(foul) <- c("matchId", "foul_away","foul_home")
+my_data<-merge(my_data,foul,by="matchId")
+
+
+foulon <- action3 %>% 
+  filter(grepl("foulon", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(foulon) <- c("matchId", "foulon_away","foulon_home")
+my_data<-merge(my_data,foulon,by="matchId")
+
+
+
+freethrow <- action3 %>% 
+  filter(grepl("freethrow", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(freethrow) <- c("matchId", "freethrow_away","freethrow_home")
+my_data<-merge(my_data,freethrow,by="matchId")
+
+
+substitution <- action3 %>% 
+  filter(grepl("substitution", actionType)) %>% group_by(matchId,homeaway) %>% count() %>% 
+  spread(key = homeaway, value = n)
+names(substitution) <- c("matchId", "substitution_away","substitution_home")
+my_data<-merge(my_data,substitution,by="matchId")
+
+```
+
+```{r}
+
+my <- my_data %>% group_by(steal_away,steal_home,turnover_away,turnover_home,
+                           assist_away,assist_home,jump_away,jump_home,three_p_away,three_p_home,
+                           rebound_away,rebound_home,block_away,block_home,foul_away,foul_home,
+                           foulon_away,foulon_home,freethrow_home,substitution_home,
+                           freethrow_away,substitution_away,
+                           two_p_away,two_p_home,homeaway,matchId, period, teamId, actionType) %>% 
+  summarise(count=n()) %>% pivot_wider(id_cols = c(steal_away,steal_home,turnover_away,turnover_home,
+                                                   assist_away,assist_home,jump_away,jump_home,three_p_away,three_p_home,
+                                                   rebound_away,rebound_home,block_away,block_home,foul_away,foul_home,
+                                                   foulon_away,foulon_home,freethrow_home,substitution_home,
+                                                   freethrow_away,substitution_away,two_p_away,
+                                                   two_p_home,homeaway,matchId, period, teamId), 
+                                       names_from = actionType,
+                                       values_from = count, values_fill = 0)
+
+
+my <- na.omit(my)
+
+my <- my[,-c(26:41)]
+```
+
+```{r}
+two_point <- my %>% rowwise() %>% 
+  mutate(high_two_point = ifelse(which.max(c(two_p_away, two_p_home)) == 1, 
+                                 "Away", "Home")) %>% 
+  ungroup() %>% 
+  mutate(high_two_point=factor(high_two_point)) %>%
+  select(-homeaway, -two_p_away, -two_p_home)
+
+
+two_point <- as.data.frame(two_point)
+```
+DECISION TREE
+```{r}
+set.seed(493)
+train.sample <- two_point$high_two_point %>% createDataPartition(p = 0.8, list = FALSE) #createDataPartition helps you define train set index
+train.data  <- two_point[train.sample, ]
+test.data <- two_point[-train.sample, ]
+
+
+train.control2 <- trainControl(
+  method = "repeatedcv",
+  number = 10, ## 10-fold CV
+  repeats = 10,## repeated three times
+  # USE AUC
+  summaryFunction = twoClassSummary, 
+  classProbs = TRUE
+)
+
+caret_fit2 <- train(high_two_point~., data=train.data, 
+                   method = "rpart2", 
+                   tuneLength = 10,
+                   trControl = train.control2,
+                   metric = "ROC")
+rpart.plot(caret_fit2$finalModel)
+
+
+```
+
+
+```{r}
+
+test_preds <-predict(caret_fit2$finalModel, test.data[,-23], type = 'class')
+table_t <- table(predicted = test_preds , actual = test.data$high_two_point)
+table_t
+
+
+```
+
+```{r}
+calc_class_err(as.numeric(unlist(test.data[,23]))-1,ifelse(as.vector(test_preds) == "Home", 1, 0))
+
+``` 
+XGBOOST
+
+```{r}
+
+xgboost_model2 <- xgboost(data = as.matrix(train.data[, -23]), 
+                         label = as.numeric(train.data$high_two_point)-1,
+                         max_depth = 3, 
+                         objective = "binary:logistic", 
+                         nrounds = 10, 
+                         verbose = FALSE)
+
+
+
+```
+
+```{r}
+xg.test_pred2 <- predict(xgboost_model2, as.matrix(test.data[,-23]), type = "response")
+xg.test_pred2<-as.factor(ifelse(xg.test_pred2 >0.5,1,0))
+```
+
+```{r}
+xg_tab2 <- table(predicted = xg.test_pred2, actual = test.data$high_two_point)
+xg_tab2
+
+```
+
+### QUESTION 3
+
+
+```{r}
+
+
+turnovers <- my %>% rowwise() %>% 
+  mutate(high_turnover = ifelse(which.max(c(turnover_away, turnover_home)) == 1, 
+                                 "Away", "Home")) %>% 
+  ungroup() %>% 
+  mutate(high_turnover=factor(high_turnover)) %>%
+  select(-homeaway, -turnover_away, -turnover_home)
+
+
+turnovers <- as.data.frame(turnovers)
+```
+DECISION TREE
+```{r}
+set.seed(493)
+train.sample <- turnovers$high_turnover %>% createDataPartition(p = 0.8, list = FALSE) #createDataPartition helps you define train set index
+train.data  <- turnovers[train.sample, ]
+test.data <- turnovers[-train.sample, ]
+
+
+train.control3 <- trainControl(
+  method = "repeatedcv",
+  number = 10, ## 10-fold CV
+  repeats = 10,## repeated three times
+  # USE AUC
+  summaryFunction = twoClassSummary, 
+  classProbs = TRUE
+)
+
+caret_fit3 <- train(high_turnover~., data=train.data, 
+                   method = "rpart2", 
+                   tuneLength = 10,
+                   trControl = train.control3,
+                   metric = "ROC")
+rpart.plot(caret_fit3$finalModel)
+
+
+
+
+```
+
+
+
+```{r}
+
+
+test_preds_2 <-predict(caret_fit3$finalModel, test.data[,-23], type = 'class')
+table_t2 <- table(predicted = test_preds_2 , actual = test.data$high_turnover)
+table_t2
+
+
+```
+
+```{r}
+calc_class_err(as.numeric(unlist(test.data[,23]))-1,ifelse(as.vector(test_preds_2) == "Home", 1, 0))
+
+``` 
+XGBOOST
+
+```{r}
+
+xgboost_model3 <- xgboost(data = as.matrix(train.data[, -23]), 
+                         label = as.numeric(train.data$high_turnover)-1,
+                         max_depth = 3, 
+                         objective = "binary:logistic", 
+                         nrounds = 10, 
+                         verbose = FALSE)
+
+
+
+```
+
+```{r}
+xg.test_pred3 <- predict(xgboost_model3, as.matrix(test.data[,-23]), type = "response")
+xg.test_pred3<-as.factor(ifelse(xg.test_pred3 >0.5,1,0))
+```
+
+```{r}
+xg_tab3 <- table(predicted = xg.test_pred3, actual = test.data$high_turnover)
+xg_tab3
+
+```
+
+
+
+
